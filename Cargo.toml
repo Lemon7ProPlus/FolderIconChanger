@@ -9,6 +9,15 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "1.1.2"
 rfd = "0.17.2"
 
+[dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+     "Win32_UI_Shell",
+]
+
 [profile.release]
 opt-level = 'z'     # Optimize for size
 lto = true          # Enable link-time optimization
