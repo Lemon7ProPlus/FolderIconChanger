@@ -175,7 +175,7 @@ impl FolderIconApp {
 
             self.rebuild_index();
             self.save_config();
-
+            let _ = restore_folder_icon(folder);
             self.status_msg = "已移除记录".to_string();
         }
     }
@@ -352,7 +352,7 @@ impl eframe::App for FolderIconApp {
                     );
                     ui.with_layout(
                         // 所选EXE的图标预览
-                        egui::Layout::left_to_right(egui::Align::Center), 
+                        egui::Layout::right_to_left(egui::Align::Center), 
                         |ui| {
                             let current_exe = self.new_exe.clone();
                             let preview_tex = self.get_cached_icon(ctx, &current_exe);
@@ -398,7 +398,7 @@ impl eframe::App for FolderIconApp {
                                     ui.add_space(4.0); // 文字和按钮的间距
                                     // 操作按钮
                                     ui.horizontal(|ui| {
-                                        if ui.add_sized(egui::vec2(120.0, 20.0), egui::Button::new(label), ).clicked() {
+                                        if ui.add_sized(egui::vec2(100.0, 20.0), egui::Button::new(label), ).clicked() {
                                             match self.execute_icon_action(
                                                 action, 
                                                 &mapping.folder_path, 

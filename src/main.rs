@@ -17,7 +17,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_icon(FolderIconApp::load_icon())
             .with_inner_size([500.0, 460.0])
-            .with_min_inner_size([400.0, 305.0])
+            .with_min_inner_size([400.0, 295.0])
             .with_title("Folder Icon Changer"),
         ..Default::default()
     };
