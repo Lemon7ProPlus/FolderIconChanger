@@ -225,7 +225,6 @@ impl FolderIconApp {
     /// 切换图标动作
     fn execute_icon_action(
         &mut self,
-        ctx: &egui::Context,
         action: Action,
         folder: &str,
         exe: &str,
@@ -242,15 +241,8 @@ impl FolderIconApp {
             );
             self.rebuild_index();
             self.save_config();
-            ctx.request_repaint(); // ⭐关键
         };
         result
-    }
-
-    /// 切换图标状态
-    fn toggle_icon_state(&mut self, folder: &str, exe: &str) {
-        let state = self.get_icon_state(folder, exe);
-        self.set_icon_state(folder, exe, !state);
     }
 
     /// 设置图标状态
@@ -408,13 +400,11 @@ impl eframe::App for FolderIconApp {
                                     ui.horizontal(|ui| {
                                         if ui.add_sized(egui::vec2(120.0, 20.0), egui::Button::new(label), ).clicked() {
                                             match self.execute_icon_action(
-                                                ctx,
                                                 action, 
                                                 &mapping.folder_path, 
                                                 &mapping.exe_path
                                             ) {
                                                 Ok(_) => {
-                                                    self.toggle_icon_state(&mapping.folder_path, &mapping.exe_path);
                                                     self.status_msg = match action {
                                                         Action::Apply => format!("已重新应用: {}", mapping.folder_path),
                                                         Action::Restore => format!("已恢复默认: {}", mapping.folder_path),
