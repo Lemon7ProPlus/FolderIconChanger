@@ -176,7 +176,7 @@ impl FolderIconApp {
             self.rebuild_index();
             self.save_config();
             let _ = restore_folder_icon(folder);
-            self.status_msg = "已移除记录".to_string();
+            self.status_msg = "已移除记录，并恢复默认！".to_string();
         }
     }
 
@@ -371,13 +371,14 @@ impl eframe::App for FolderIconApp {
 
             // === 列表区域 ===
             ui.heading("已配置映射:");
-            let cloned_mappings = self.config.mappings.clone();
+            let mappings = self.config.mappings.clone();
             // 因为放在了 CentralPanel 里，ScrollArea 现在只会延伸到状态栏上方，绝对不会重叠
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .show(ui, |ui| {
-                for (_i, mapping) in cloned_mappings.into_iter().enumerate() {
+                // for (_i, mapping) in cloned_mappings.into_iter().enumerate() {
+                for mapping in mappings {
                     let applied = self.get_icon_state(&mapping.folder_path, &mapping.exe_path);
                     let action = if applied {Action::Restore} else {Action::Apply};
                     let label = if applied {"↺ 恢复默认"} else {"▶ 重新应用"};
