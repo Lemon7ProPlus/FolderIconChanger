@@ -1,10 +1,19 @@
 // src/gui.rs
 
 use eframe::egui;
+use std::sync::Arc;
 use std::{collections::HashMap, fs};
-use once_cell::unsync::OnceCell;
+use std::sync::OnceLock;
+use std::cell::RefCell;
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::thread;
 
-use crate::{constants::CONFIG_FILE, icon_extractor, types::{AppConfig, FolderExeMapping}, utils::{apply_folder_icon, restore_folder_icon}};
+use crate::{
+    constants::CONFIG_FILE, 
+    icon_extractor, 
+    types::{AppConfig, FolderExeMapping}, 
+    utils::{apply_folder_icon, restore_folder_icon}
+};
 
 // --- UI 应用程序 ---
 
@@ -13,6 +22,21 @@ enum Action {
     Apply,
     Restore,
 }
+
+enum PendingOp {
+    ApplyRow(usize),
+    RestoreRow(usize),
+    RemoveRow(usize),
+}
+
+// 新增状态枚举
+enum IconState {
+    Loading,
+    Ready(Option<egui::TextureHandle>),
+}
+
+// 定义线程之间传递的消息：(EXE路径, 解析出的像素图)
+type IconMsg = (String, Option<egui::ColorImage>);
 
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct MappingKey {
@@ -26,12 +50,16 @@ pub struct FolderIconApp {
     new_folder: String,
     new_exe: String,
     status_msg: String,
-    default_icon: OnceCell<egui::TextureHandle>,
-    icon_cache: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+    default_icon: OnceLock<egui::TextureHandle>,
+    icon_cache: RefCell<HashMap<String, IconState>>,
+    // 多线程通信管道
+    icon_tx: Sender<IconMsg>,
+    icon_rx: Receiver<IconMsg>,
 }
 
 impl Default for FolderIconApp {
     fn default() -> Self {
+        let (icon_tx, icon_rx) = mpsc::channel();
         // 启动时读取配置
         let config = if let Ok(data) = fs::read_to_string(CONFIG_FILE) {
             toml::from_str(&data).unwrap_or_default()
@@ -45,8 +73,10 @@ impl Default for FolderIconApp {
             new_folder: String::new(),
             new_exe: String::new(),
             status_msg: "Ready".to_string(),
-            default_icon: OnceCell::new(),
-            icon_cache: std::collections::HashMap::new(),
+            default_icon: OnceLock::new(),
+            icon_cache: RefCell::new(HashMap::new()),
+            icon_tx,
+            icon_rx,
         }
     }
 }
@@ -54,6 +84,7 @@ impl Default for FolderIconApp {
 impl FolderIconApp {
     /// 构造函数，在创建 App 实例时调用
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let (icon_tx, icon_rx) = mpsc::channel();
         // 1. 设置中文字体
         Self::setup_custom_fonts(&cc.egui_ctx);
         // 2. 读取配置文件
@@ -69,8 +100,10 @@ impl FolderIconApp {
             new_folder: String::new(),
             new_exe: String::new(),
             status_msg: "就绪".to_string(),
-            default_icon: OnceCell::new(),
-            icon_cache: HashMap::new(),
+            default_icon: OnceLock::new(),
+            icon_cache: RefCell::new(HashMap::new()),
+            icon_tx,
+            icon_rx,
         };
         // 4. 构建 index
         app.rebuild_index();
@@ -96,7 +129,12 @@ impl FolderIconApp {
     /// 设置中文字体
     fn setup_custom_fonts(ctx: &egui::Context) {
         let mut fonts = egui::FontDefinitions::default();
-        let font_candidates = ["C:\\Windows\\Fonts\\msyhbd.ttc", "C:\\Windows\\Fonts\\msyh.ttc"];
+        let font_candidates = [
+            "C:\\Windows\\Fonts\\msyhbd.ttc", // 微软雅黑 粗体
+            "C:\\Windows\\Fonts\\msyh.ttc",   // 微软雅黑 常规
+            "C:\\Windows\\Fonts\\simhei.ttf", // 黑体
+            "C:\\Windows\\Fonts\\simsun.ttc", // 宋体
+        ];
         let mut font_data = None;
         for path in font_candidates {
             if let Ok(data) = std::fs::read(path) {
@@ -106,15 +144,16 @@ impl FolderIconApp {
         }
 
         if let Some(data) = font_data {
-            fonts.font_data.insert("sys_font".to_owned(), egui::FontData::from_owned(data).into());
+            fonts.font_data.insert("sys_font".to_owned(), Arc::new(egui::FontData::from_owned(data)).into());
             fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0, "sys_font".to_owned());
             fonts.families.get_mut(&egui::FontFamily::Monospace).unwrap().push("sys_font".to_owned());
             ctx.set_fonts(fonts);
         }
     }
+
     /// 序列化配置
     fn normalize(p: &str) -> String {
-        p.to_lowercase()
+        p.replace('\\', "/").to_lowercase()
     }
     fn rebuild_index(&mut self) {
         self.index.clear();
@@ -206,20 +245,32 @@ impl FolderIconApp {
     }
 
     /// 获取缓存的图标（如果不存在，则即时提取并生成 egui 纹理）
-    fn get_cached_icon(&mut self, ctx: &egui::Context, exe_path: &str) -> Option<egui::TextureHandle> {
+    fn get_cached_icon(&self, ctx: &egui::Context, exe_path: &str) -> Option<egui::TextureHandle> {
         if exe_path.is_empty() { return None; }
         // 核心逻辑：如果在缓存中找不到，就去调用 Windows API 提取
-        if !self.icon_cache.contains_key(exe_path) {
-            let tex = if let Some((pixels, w, h)) = icon_extractor::get_exe_icon_pixels(exe_path) {
-                // 转换像素数据为 egui 支持的 ColorImage
-                let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
-                Some(ctx.load_texture(exe_path, img, egui::TextureOptions::LINEAR))
-            } else {
-                None
-            };
-            self.icon_cache.insert(exe_path.to_string(), tex);
+        let mut cache = self.icon_cache.borrow_mut();
+        // 1. 如果完全没有记录，说明是第一次请求
+        if !cache.contains_key(exe_path) {
+            cache.insert(exe_path.to_string(), IconState::Loading);
+
+            let tx = self.icon_tx.clone();
+            let path = exe_path.to_string();
+            let ctx_clone = ctx.clone();
+            // 2. 开启后台线程进行耗时的磁盘 I/O 和图像解析
+            thread::spawn(move || {
+                let img_opt = icon_extractor::get_exe_icon_pixels(&path).map(|(pixels, w, h)| {
+                    egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels)
+                });
+                let _ = tx.send((path, img_opt));
+                let _ = &ctx_clone.request_repaint();
+            });
+            return None;
         }
-        self.icon_cache.get(exe_path).unwrap().clone()
+        // 3. 检查缓存状态
+        match cache.get(exe_path).unwrap() {
+            IconState::Loading => None, // 还在后台提取中，继续返回 None
+            IconState::Ready(tex_opt) => tex_opt.clone(), // 提取完毕，返回真实贴图
+        }
     }
 
     /// 切换图标动作
@@ -255,37 +306,32 @@ impl FolderIconApp {
             self.config.mappings[idx].icon_state = state;
         }
     }
-    
-    /// 查询图标状态
-    fn get_icon_state(&mut self, folder: &str, exe: &str) -> bool {
-        let key = MappingKey {
-            folder_path: Self::normalize(folder),
-            exe_path: Self::normalize(exe),
-        };
-        if let Some(&idx) = self.index.get(&key) {
-            self.config.mappings[idx].icon_state
-        } else {
-            false
-        }
-    }
 }
 
 impl eframe::App for FolderIconApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame)  {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame)  {
         // lazy init textures，使用oncecell惰性初始化
-        self.init_default_icon(ctx);
+        self.init_default_icon(ui.ctx());
+        // try_recv() 是非阻塞的，瞬间就能把收件箱清空
+        while let Ok((path, img_opt)) = self.icon_rx.try_recv() {
+            // 将像素数据上传到显卡，变成 TextureHandle
+            let tex_opt = img_opt.map(|img| {
+                ui.ctx().load_texture(&path, img, egui::TextureOptions::LINEAR)
+            });
+            // 更新缓存，状态从 Loading 变为 Ready
+            self.icon_cache.borrow_mut().insert(path, IconState::Ready(tex_opt));
+        }
         
         // --- 1. 优先绘制底部状态栏 ---
         // TopBottomPanel::bottom 会将这部分永远固定在窗口最底部
-        egui::TopBottomPanel::bottom("status_panel").show(ctx, |ui| {
+        egui::Panel::bottom("status_panel").show_inside(ui, |ui| {
             ui.add_space(4.0);
             ui.label(format!("状态: {}", self.status_msg));
             ui.add_space(4.0);
         });
-
         // --- 2. 绘制上方区域和中间的列表区 ---
         // CentralPanel 会自动占据除了底部状态栏以外的所有剩余空间
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.heading("Windows 文件夹图标修改器");
             ui.separator();
             ui.heading("添加新映射：");
@@ -355,7 +401,7 @@ impl eframe::App for FolderIconApp {
                         egui::Layout::right_to_left(egui::Align::Center), 
                         |ui| {
                             let current_exe = self.new_exe.clone();
-                            let preview_tex = self.get_cached_icon(ctx, &current_exe);
+                            let preview_tex = self.get_cached_icon(ui.ctx(), &current_exe);
                             let default_tex = self.default_icon.get().unwrap();
                             let tex = preview_tex
                                 .as_ref()
@@ -371,16 +417,14 @@ impl eframe::App for FolderIconApp {
 
             // === 列表区域 ===
             ui.heading("已配置映射:");
-            let mappings = self.config.mappings.clone();
+            let mut pending_op = None;
             // 因为放在了 CentralPanel 里，ScrollArea 现在只会延伸到状态栏上方，绝对不会重叠
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .show(ui, |ui| {
-                // for (_i, mapping) in cloned_mappings.into_iter().enumerate() {
-                for mapping in mappings {
-                    let applied = self.get_icon_state(&mapping.folder_path, &mapping.exe_path);
-                    let action = if applied {Action::Restore} else {Action::Apply};
+                for (idx, mapping) in self.config.mappings.iter().enumerate() {
+                    let applied = mapping.icon_state;
                     let label = if applied {"↺ 恢复默认"} else {"▶ 重新应用"};
                     ui.group(|ui| {
                         ui.set_min_width(ui.available_width());
@@ -400,22 +444,11 @@ impl eframe::App for FolderIconApp {
                                     // 操作按钮
                                     ui.horizontal(|ui| {
                                         if ui.add_sized(egui::vec2(100.0, 20.0), egui::Button::new(label), ).clicked() {
-                                            match self.execute_icon_action(
-                                                action, 
-                                                &mapping.folder_path, 
-                                                &mapping.exe_path
-                                            ) {
-                                                Ok(_) => {
-                                                    self.status_msg = match action {
-                                                        Action::Apply => format!("已重新应用: {}", mapping.folder_path),
-                                                        Action::Restore => format!("已恢复默认: {}", mapping.folder_path),
-                                                    };
-                                                }
-                                                Err(e) => self.status_msg = e,
-                                            }
+                                            pending_op = Some(if applied { PendingOp::RestoreRow(idx) } else { PendingOp::ApplyRow(idx) });
                                         }
                                         if ui.button("🗑 移除").clicked() {
-                                            self.remove_mappling(&mapping.folder_path, &mapping.exe_path);
+                                            pending_op = Some(PendingOp::RemoveRow(idx));
+                                            // self.remove_mappling(&mapping.folder_path, &mapping.exe_path);
                                         }
                                     });
                                 }
@@ -423,22 +456,42 @@ impl eframe::App for FolderIconApp {
 
                             // --- 列表右侧：显示应用图标 ---
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if applied {
-                                    if let Some(tex) = self.get_cached_icon(ctx, &mapping.exe_path) {
-                                        ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(32.0, 32.0)));
-                                    } else {
-                                        let default_tex = self.default_icon.get().unwrap();
-                                        ui.add(egui::Image::new(default_tex).fit_to_exact_size(egui::vec2(32.0, 32.0)));
-                                    }
+                                let tex = if applied {
+                                    // 这里使用 &self 借用，完全合法
+                                    self.get_cached_icon(ui.ctx(), &mapping.exe_path)
                                 } else {
-                                    let default_tex = self.default_icon.get().unwrap();
-                                    ui.add(egui::Image::new(default_tex).fit_to_exact_size(egui::vec2(32.0, 32.0)));
-                                }
+                                    None
+                                };
+                                let display_tex = tex.unwrap_or_else(|| self.default_icon.get().unwrap().clone());
+                                ui.add(egui::Image::new(&display_tex).fit_to_exact_size(egui::vec2(32.0, 32.0)));
                             });
                         });
                     });
                 }
             });
+            if let Some(op) = pending_op {
+                match op {
+                    PendingOp::ApplyRow(idx) | PendingOp::RestoreRow(idx) => {
+                        let folder = self.config.mappings[idx].folder_path.clone();
+                        let exe = self.config.mappings[idx].exe_path.clone();
+                        let action = if matches!(op, PendingOp::ApplyRow(_)) {Action::Apply} else {Action::Restore};
+                        match self.execute_icon_action(action, &folder, &exe) {
+                            Ok(_) => {
+                                self.status_msg = match action {
+                                    Action::Apply => format!("已重新应用：{}", folder),
+                                    Action::Restore => format!("已恢复默认：{}", folder),
+                                };
+                            }
+                            Err(e) => self.status_msg = e,
+                        }
+                    }
+                    PendingOp::RemoveRow(idx) => {
+                        let folder = self.config.mappings[idx].folder_path.clone();
+                        let exe = self.config.mappings[idx].exe_path.clone();
+                        self.remove_mappling(&folder, &exe);
+                    }
+                }
+            }
         });
     }
 }
