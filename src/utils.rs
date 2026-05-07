@@ -4,7 +4,7 @@ use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::fs;
 
-use crate::constants::CREATE_NO_WINDOW;
+pub const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- 核心业务逻辑 ---
 

@@ -1,9 +1,1 @@
-[[mappings]]
-folder_path = 'D:\app\software\Billfish'
-exe_path = 'D:\app\software\Billfish\Billfish.exe'
-icon_state = true
-
-[[mappings]]
-folder_path = 'D:\app\software\Mozilla Firefox'
-exe_path = 'D:\app\software\Mozilla Firefox\firefox.exe'
-icon_state = true
+mappings = []
