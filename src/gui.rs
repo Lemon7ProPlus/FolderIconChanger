@@ -1,12 +1,14 @@
 // src/gui.rs
 
 use eframe::egui;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::Arc;
 
 use crate::app_state::AppState;
 use crate::config_store::ConfigStore;
-use crate::icon_cache::IconCache;
+use crate::icon_provider::IconProvider;
 use crate::app_state::Action;
 use crate::types::FolderExeMapping;
 use crate::CONFIG_FILE;
@@ -14,18 +16,20 @@ use crate::CONFIG_FILE;
 // --- UI 应用程序 ---
 
 enum PendingOp {
-    ApplyRow(String, String),
-    RestoreRow(String, String),
+    ApplyRow(usize),
+    RestoreRow(usize),
     RemoveRow(usize),
 }
 
 pub struct FolderIconApp {
     state: AppState,
     store: ConfigStore,
-    icon_cache: IconCache,
+    provider: IconProvider,
     
     new_folder: String,
     new_exe: String,
+
+    texture_cache: RefCell<HashMap<String, Option<egui::TextureHandle>>>,
     default_icon: OnceLock<egui::TextureHandle>,
 }
 
@@ -34,19 +38,41 @@ impl FolderIconApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         initial_config: crate::types::AppConfig,
-        watcher_rx: std::sync::mpsc::Receiver<crate::types::AppConfig>
+        watcher_rx: std::sync::mpsc::Receiver<Result<crate::types::AppConfig, String>>
     ) -> Self {
         Self::setup_custom_fonts(&cc.egui_ctx);
         
         Self {
             state: AppState::new(initial_config, watcher_rx),
             store: ConfigStore::new(CONFIG_FILE),
-            icon_cache: IconCache::new(),
+            provider: IconProvider::new(),
+            texture_cache: RefCell::new(HashMap::new()),
             new_folder: String::new(),
             new_exe: String::new(),
             default_icon: OnceLock::new(),
         }
     }
+
+    /// UI 层自己负责“获取/触发加载”纹理
+    fn get_texture(&self, ctx: &egui::Context, exe_path: &str) -> Option<egui::TextureHandle> {
+        if exe_path.is_empty() { return None; }
+
+        let mut cache = self.texture_cache.borrow_mut();
+        
+        if !cache.contains_key(exe_path) {
+            // 1. 在 UI 缓存中标记为 Loading (None)
+            cache.insert(exe_path.to_string(), None);
+            
+            // 2. 将 ctx 闭包作为 Waker 传给底层逻辑
+            let ctx_clone = ctx.clone();
+            self.provider.fetch_icon_async(exe_path.to_string(), move || {
+                ctx_clone.request_repaint(); // 专门给 egui 用的唤醒逻辑
+            });
+            return None;
+        }
+
+        cache.get(exe_path).unwrap().clone()
+    }   
 
     /// 设置窗口图标
     pub fn load_icon() -> egui::IconData {
@@ -110,13 +136,23 @@ impl FolderIconApp {
 
 impl eframe::App for FolderIconApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame)  {
-        // 核心：让中枢处理完这帧所有的后台数据
-        if self.state.tick() {
-            // 如果底层任务改变了内存配置状态，顺手触发一次防抖落盘
+        // 1. 核心：每帧无条件调用，消化后台的成功/报错消息和文件热更新！
+        let tick_waker_ctx = ui.ctx().clone();
+        if self.state.tick(move || tick_waker_ctx.request_repaint()) {
             self.store.save_debounced(self.state.config.clone());
         }
-        // 核心：处理并提取多线程发回来的图标
-        self.icon_cache.tick(ui.ctx());
+        // 2. 接收底层 IconProvider 发来的像素数据，转换为 GPU 纹理
+        while let Ok((path, raw_opt)) = self.provider.rx.try_recv() {
+            let tex_opt = raw_opt.map(|raw| {
+                let img = egui::ColorImage::from_rgba_unmultiplied([raw.width as usize, raw.height as usize], 
+                    &raw.pixels
+                );
+                ui.ctx().load_texture(&path, img, egui::TextureOptions::LINEAR)
+            });
+            // 存入 UI 层的字典中
+            self.texture_cache.borrow_mut().insert(path, tex_opt);
+        }
+        // 3. 初始化默认的文件夹图标
         self.init_default_icon(ui.ctx());
 
         // --- 1. 优先绘制底部状态栏 ---
@@ -146,16 +182,18 @@ impl eframe::App for FolderIconApp {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.button("➕ 添加").clicked() {
                                         if !self.new_folder.is_empty() && !self.new_exe.is_empty() {
-                                            // 1. 修改内存
+                                            let ctx_clone = ui.ctx().clone();
+                                            let waker = move || ctx_clone.request_repaint();
+                                            // 乐观更新：直接改内存
                                             self.state.config.mappings.push(FolderExeMapping {
                                                 folder_path: self.new_folder.clone(),
                                                 exe_path: self.new_exe.clone(),
                                                 icon_state: true,
                                             });
-                                            // 2. 发送防抖写盘请求 (非阻塞)
+                                            // 触发防抖写盘和系统IO
+                                            self.state.mark_internal_change();
                                             self.store.save_debounced(self.state.config.clone());
-                                            // 3. 触发底层操作任务 (非阻塞)
-                                            self.state.spawn_io_task(Action::Apply, self.new_folder.clone(), self.new_exe.clone());
+                                            self.state.spawn_io_task(Action::Apply, self.new_folder.clone(), self.new_exe.clone(), waker);
                                             
                                             self.new_folder.clear();
                                             self.new_exe.clear();
@@ -203,7 +241,7 @@ impl eframe::App for FolderIconApp {
                         egui::Layout::right_to_left(egui::Align::Center), 
                         |ui| {
                             let current_exe = self.new_exe.clone();
-                            let preview_tex = self.icon_cache.get(ui.ctx(), &current_exe);
+                            let preview_tex = self.get_texture(ui.ctx(), &current_exe);
                             let default_tex = self.default_icon.get().unwrap();
                             let tex = preview_tex
                                 .as_ref()
@@ -247,9 +285,9 @@ impl eframe::App for FolderIconApp {
                                     ui.horizontal(|ui| {
                                         if ui.add_sized(egui::vec2(100.0, 20.0), egui::Button::new(label), ).clicked() {
                                             pending_op = Some(if applied { 
-                                                PendingOp::RestoreRow(mapping.folder_path.clone(), mapping.exe_path.clone())  
+                                                PendingOp::RestoreRow(idx)  
                                             } else { 
-                                                PendingOp::ApplyRow(mapping.folder_path.clone(), mapping.exe_path.clone()) 
+                                                PendingOp::ApplyRow(idx) 
                                             });
                                         }
                                         if ui.button("🗑 移除").clicked() {
@@ -263,7 +301,7 @@ impl eframe::App for FolderIconApp {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 let tex = if applied {
                                     // 这里使用 &self 借用，完全合法
-                                    self.icon_cache.get(ui.ctx(), &mapping.exe_path)
+                                    self.get_texture(ui.ctx(), &mapping.exe_path)
                                 } else {
                                     None
                                 };
@@ -275,19 +313,28 @@ impl eframe::App for FolderIconApp {
                 }
             });
             if let Some(op) = pending_op {
+                let ctx_clone = ui.ctx().clone();
+                let waker = move || ctx_clone.request_repaint();
                 match op {
-                    PendingOp::ApplyRow(folder, exe) => {
-                        self.state.spawn_io_task(Action::Apply, folder, exe);
+                    PendingOp::ApplyRow(idx) => {
+                        self.state.config.mappings[idx].icon_state = true;
+                        let m = &self.state.config.mappings[idx];
+                        self.state.spawn_io_task(Action::Apply, m.folder_path.clone(), m.exe_path.clone(), waker);
                     }
-                    PendingOp::RestoreRow(folder, exe) => {
-                        self.state.spawn_io_task(Action::Restore, folder, exe);
+                    PendingOp::RestoreRow(idx) => {
+                        self.state.config.mappings[idx].icon_state = false;
+                        let m = &self.state.config.mappings[idx];
+                        self.state.spawn_io_task(Action::Restore, m.folder_path.clone(), m.exe_path.clone(), waker);
                     }
                     PendingOp::RemoveRow(idx) => {
-                        let mapping = self.state.config.mappings.remove(idx);
-                        self.state.spawn_io_task(Action::Restore, mapping.folder_path, mapping.exe_path);
-                        self.store.save_debounced(self.state.config.clone());
+                        let m = self.state.config.mappings.remove(idx);
+                        self.state.spawn_io_task(Action::Restore, m.folder_path, m.exe_path, waker);
                     }
                 }
+                // 标记内部发生修改（屏蔽接下来的文件监听 2 秒钟）
+                self.state.mark_internal_change();
+                // 派发持久化写盘
+                self.store.save_debounced(self.state.config.clone());
             }
         });
     }
