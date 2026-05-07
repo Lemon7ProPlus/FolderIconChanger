@@ -1,6 +1,6 @@
 // src/app_state.rs
 
-use std::{sync::mpsc, thread};
+use std::{collections::HashMap, sync::mpsc, thread};
 
 use crate::{types::AppConfig, utils::{apply_folder_icon, restore_folder_icon}};
 
@@ -56,11 +56,13 @@ impl AppState {
             }
         }
 
-        // 2. 处理文件热更新
+        // 2. 处理文件热更新：加入 Diff 同步逻辑！
         while let Ok(new_config) = self.watcher_rx.try_recv() {
             if self.config != new_config {
+                // 只有在真的不一致时，才执行差异调和（防止无限循环）
+                self.reconcile_os_state(&self.config, &new_config);
                 self.config = new_config;
-                self.status_msg = "配置已自动热重载！".into();
+                self.status_msg = "配置已外部修改，正在自动同步系统图标...".into();
             }
         }
 
@@ -77,5 +79,51 @@ impl AppState {
             };
             let _ = tx.send(TaskResult { folder, exe, action, success: result.is_ok(), msg: result.err() });
         });
+    }
+    
+    /// 核心逻辑：比对新老配置，将修改自动同步到操作系统
+    fn reconcile_os_state(&self, old_cfg: &AppConfig, new_cfg: &AppConfig) {
+        // 构建旧映射的字典 (忽略路径大小写)
+        let mut old_map = HashMap::new();
+        for m in &old_cfg.mappings {
+            old_map.insert(m.folder_path.to_lowercase(), m);
+        }
+
+        let mut new_map = HashMap::new();
+        for m in &new_cfg.mappings {
+            new_map.insert(m.folder_path.to_lowercase(), m);
+        }
+
+        // 第一步：检查【新增】和【被修改】的条目
+        for (folder_lower, new_m) in &new_map {
+            match old_map.get(folder_lower) {
+                Some(old_m) => {
+                    // 如果状态变了，或者绑定的 exe 变了
+                    if old_m.icon_state != new_m.icon_state || old_m.exe_path != new_m.exe_path {
+                        if new_m.icon_state {
+                            self.spawn_io_task(Action::Apply, new_m.folder_path.clone(), new_m.exe_path.clone());
+                        } else {
+                            self.spawn_io_task(Action::Restore, new_m.folder_path.clone(), new_m.exe_path.clone());
+                        }
+                    }
+                }
+                None => {
+                    // 以前没有这个文件夹，现在手动添加了
+                    if new_m.icon_state {
+                        self.spawn_io_task(Action::Apply, new_m.folder_path.clone(), new_m.exe_path.clone());
+                    }
+                }
+            }
+        }
+
+        // 第二步：检查【被删除】的条目
+        for (folder_lower, old_m) in &old_map {
+            if !new_map.contains_key(folder_lower) {
+                // 如果用户在 config.toml 里直接把这一行删掉了，且之前它是生效的，就把它恢复默认
+                if old_m.icon_state {
+                    self.spawn_io_task(Action::Restore, old_m.folder_path.clone(), old_m.exe_path.clone());
+                }
+            }
+        }
     }
 }
