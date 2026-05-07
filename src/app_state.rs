@@ -13,7 +13,6 @@ pub enum Action {
 
 pub struct TaskResult {
     pub folder: String,
-    pub exe: String,
     pub action: Action,
     pub success: bool,
     pub msg: Option<String>,
@@ -77,7 +76,7 @@ impl AppState {
                 Action::Apply => apply_folder_icon(&folder, &exe),
                 Action::Restore => restore_folder_icon(&folder),
             };
-            let _ = tx.send(TaskResult { folder, exe, action, success: result.is_ok(), msg: result.err() });
+            let _ = tx.send(TaskResult { folder, action, success: result.is_ok(), msg: result.err() });
         });
     }
     
